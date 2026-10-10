@@ -1,0 +1,531 @@
+plugins {
+    id 'fabric-loom' version '1.7-SNAPSHOT'
+}
+version = project.mod_version
+group = project.maven_group
+base { archivesName = project.archives_base_name }
+repositories {}
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+}
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") { expand "version": project.version }
+}
+tasks.withType(JavaCompile).configureEach { it.options.release = 21 }
+java {
+    withSourcesJar()
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+org.gradle.jvmargs=-Xmx1G
+minecraft_version=1.21.1
+yarn_mappings=1.21.1+build.3
+loader_version=0.16.5
+fabric_version=0.105.0+1.21.1
+mod_version=0.1.0
+maven_group=gg.ghostdrop
+archives_base_name=ghost-drop
+
+# Ghost Drop (Minecraft Java x Call of Duty: Warzone)
+
+Solo Fabric mod for Minecraft Java 1.21.1. You start as normal Steve. After about two minutes of play a supply
+crate drops nearby, along with a squad of hostiles (4 husks, 2 pillagers). Right-click the crate to equip a Ghost-style
+loadout: skull mask, tactical vest, combat pants, boots, a suppressed rifle and a combat knife.
+
+All art is original pixel art made for this mod. No Call of Duty models, textures or sounds are included.
+
+## Status
+SOURCE ONLY, NOT COMPILED OR TESTED. It was written without network access, so versions and a few
+Minecraft API signatures (1.21.1 Yarn) still need checking by a real build. Sheet preflight passes (`python3 tools/preflight.py`).
+
+## Build
+1. Install JDK 21 and Gradle (or add a Gradle wrapper with `gradle wrapper`).
+2. `gradle build` -> jar in `build/libs/`.
+3. Put the jar in the mods folder of a Fabric 1.21.1 profile together with Fabric API 0.105.0+1.21.1.
+4. Start a new world and play for about two minutes.
+
+## Tuning
+All numbers live in `src/main/resources/data/ghostdrop/sheets/*.json` (weapons, armor, crate, mobs).
+Change the sheet first, then run `python3 tools/preflight.py`.
+
+## Likely first build fixes
+- `ArrowEntity` constructor arguments in `SuppressedRifleItem`
+- `onUse` signature and `createCodec` in `SupplyCrateBlock`
+- `ArmorMaterial` constructor in `ModItems`
+- versions in `gradle.properties`
+
+## Melty publishing notes (for a coding agent on the player's PC)
+- Host game: Minecraft: Java Edition (role "primary"), loader Fabric. Solo only for v1.
+- Call of Duty cannot be a "companion" in the Melty sense here: Warzone's files are not readable by a Minecraft mod,
+  so this mod ships original look-alike content only. Decide with the owner whether that still qualifies as a mashup before publishing.
+- Ship a portable Prism Launcher instance whose mmc-pack.json names Fabric, with this jar and Fabric API in its mods folder.
+- Screenshot must be a real capture of the mod running (crate drop or loadout equipped).
+
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+    }
+}
+
+package gg.ghostdrop;
+
+import com.google.gson.JsonObject;
+import net.minecraft.entity.projectile.ArrowEntity;
+import net.minecraft.entity.projectile.PersistentProjectileEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.util.Hand;
+import net.minecraft.util.TypedActionResult;
+import net.minecraft.world.World;
+
+/** Quiet, fast, ammo-free "rifle": fires an arrow-speed round with a short cooldown. Values come from weapons.json. */
+public class SuppressedRifleItem extends Item {
+    private final int cooldown;
+    private final float velocity, inaccuracy, soundVolume, soundPitch;
+    private final double damage;
+
+    public SuppressedRifleItem(Settings settings, JsonObject row) {
+        super(settings);
+        this.cooldown = row.get("cooldownTicks").getAsInt();
+        this.velocity = row.get("velocity").getAsFloat();
+        this.inaccuracy = row.get("inaccuracy").getAsFloat();
+        this.damage = row.get("damage").getAsDouble();
+        this.soundVolume = row.get("soundVolume").getAsFloat();
+        this.soundPitch = row.get("soundPitch").getAsFloat();
+    }
+
+    @Override
+    public TypedActionResult<ItemStack> use(World world, PlayerEntity player, Hand hand) {
+        ItemStack stack = player.getStackInHand(hand);
+        if (!world.isClient) {
+            ArrowEntity round = new ArrowEntity(world, player, new ItemStack(Items.ARROW), null);
+            round.setVelocity(player, player.getPitch(), player.getYaw(), 0.0f, velocity, inaccuracy);
+            round.setDamage(damage);
+            round.pickupType = PersistentProjectileEntity.PickupPermission.DISALLOWED;
+            world.spawnEntity(round);
+            world.playSound(null, player.getX(), player.getY(), player.getZ(),
+                    SoundEvents.ENTITY_ARROW_SHOOT, SoundCategory.PLAYERS, soundVolume, soundPitch);
+        }
+        player.getItemCooldownManager().set(this, cooldown);
+        return TypedActionResult.success(stack, world.isClient());
+    }
+}
+
+package gg.ghostdrop;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import java.util.EnumMap;
+import java.util.List;
+import java.util.Map;
+import net.minecraft.block.AbstractBlock;
+import net.minecraft.block.Block;
+import net.minecraft.block.Blocks;
+import net.minecraft.block.MapColor;
+import net.minecraft.block.sound.BlockSoundGroup;
+import net.minecraft.item.ArmorItem;
+import net.minecraft.item.ArmorMaterial;
+import net.minecraft.item.BlockItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.SwordItem;
+import net.minecraft.item.ToolMaterials;
+import net.minecraft.recipe.Ingredient;
+import net.minecraft.registry.Registries;
+import net.minecraft.registry.Registry;
+import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.util.Identifier;
+
+/** Registers everything listed in the sheets. */
+public final class ModItems {
+    public static Block SUPPLY_CRATE;
+
+    public static void register() {
+        JsonObject crate = Sheets.crate;
+        SUPPLY_CRATE = Registry.register(Registries.BLOCK, id(crate.get("id").getAsString()),
+                new SupplyCrateBlock(AbstractBlock.Settings.create().mapColor(MapColor.OLIVE_GREEN)
+                        .strength(1.5f).sounds(BlockSoundGroup.WOOD)));
+        Registry.register(Registries.ITEM, id(crate.get("id").getAsString()),
+                new BlockItem(SUPPLY_CRATE, new Item.Settings()));
+
+        // Armor (Ghost look)
+        JsonObject mat = Sheets.armor.getAsJsonObject("material");
+        Map<ArmorItem.Type, Integer> defense = new EnumMap<>(ArmorItem.Type.class);
+        for (JsonElement e : Sheets.armor.getAsJsonArray("pieces")) {
+            JsonObject p = e.getAsJsonObject();
+            defense.put(typeOf(p.get("slot").getAsString()), p.get("defense").getAsInt());
+        }
+        defense.putIfAbsent(ArmorItem.Type.BODY, 6);
+        RegistryEntry<ArmorMaterial> material = Registry.registerReference(Registries.ARMOR_MATERIAL,
+                id(mat.get("layer").getAsString()),
+                new ArmorMaterial(defense, mat.get("enchantability").getAsInt(),
+                        SoundEvents.ITEM_ARMOR_EQUIP_LEATHER, () -> Ingredient.ofItems(net.minecraft.item.Items.IRON_INGOT),
+                        List.of(new ArmorMaterial.Layer(id(mat.get("layer").getAsString()))),
+                        mat.get("toughness").getAsFloat(), mat.get("knockbackResistance").getAsFloat()));
+        int mult = mat.get("durabilityMultiplier").getAsInt();
+        for (JsonElement e : Sheets.armor.getAsJsonArray("pieces")) {
+            JsonObject p = e.getAsJsonObject();
+            ArmorItem.Type type = typeOf(p.get("slot").getAsString());
+            Registry.register(Registries.ITEM, id(p.get("id").getAsString()),
+                    new ArmorItem(material, type, new Item.Settings().maxDamage(type.getMaxDamage(mult))));
+        }
+
+        // Weapons
+        JsonObject rifle = Sheets.weapons.getAsJsonObject("rifle");
+        Registry.register(Registries.ITEM, id(rifle.get("id").getAsString()),
+                new SuppressedRifleItem(new Item.Settings().maxCount(1), rifle));
+        JsonObject knife = Sheets.weapons.getAsJsonObject("knife");
+        Registry.register(Registries.ITEM, id(knife.get("id").getAsString()),
+                new SwordItem(ToolMaterials.IRON, new Item.Settings().attributeModifiers(
+                        SwordItem.createAttributeModifiers(ToolMaterials.IRON,
+                                knife.get("attackDamage").getAsInt(), knife.get("attackSpeed").getAsFloat()))));
+    }
+
+    public static Identifier id(String path) { return Identifier.of("ghostdrop", path); }
+
+    private static ArmorItem.Type typeOf(String slot) {
+        return switch (slot) {
+            case "helmet" -> ArmorItem.Type.HELMET;
+            case "chestplate" -> ArmorItem.Type.CHESTPLATE;
+            case "leggings" -> ArmorItem.Type.LEGGINGS;
+            case "boots" -> ArmorItem.Type.BOOTS;
+            default -> throw new IllegalArgumentException("Unknown armor slot in sheet: " + slot);
+        };
+    }
+
+    private ModItems() {}
+}
+
+package gg.ghostdrop;
+
+import com.mojang.serialization.MapCodec;
+import net.minecraft.block.AbstractBlock;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+import net.minecraft.entity.EquipmentSlot;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.item.ArmorItem;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+import net.minecraft.particle.ParticleTypes;
+import net.minecraft.registry.Registries;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.Text;
+import net.minecraft.util.ActionResult;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.World;
+import com.google.gson.JsonElement;
+
+/** Right-click to equip the loadout listed in crate.json. The crate is consumed. */
+public class SupplyCrateBlock extends Block {
+    public static final MapCodec<SupplyCrateBlock> CODEC = createCodec(SupplyCrateBlock::new);
+
+    public SupplyCrateBlock(AbstractBlock.Settings settings) { super(settings); }
+
+    @Override
+    protected MapCodec<? extends Block> getCodec() { return CODEC; }
+
+    @Override
+    protected ActionResult onUse(BlockState state, World world, BlockPos pos, PlayerEntity player, BlockHitResult hit) {
+        if (world.isClient) return ActionResult.SUCCESS;
+        for (JsonElement e : Sheets.crate.getAsJsonArray("loadout")) {
+            Item item = Registries.ITEM.get(ModItems.id(e.getAsString()));
+            ItemStack stack = new ItemStack(item);
+            if (item instanceof ArmorItem armor) {
+                EquipmentSlot slot = armor.getSlotType();
+                ItemStack old = player.getEquippedStack(slot);
+                if (!old.isEmpty()) player.giveItemStack(old.copy());
+                player.equipStack(slot, stack);
+            } else {
+                player.giveItemStack(stack);
+            }
+        }
+        world.breakBlock(pos, false);
+        ((ServerWorld) world).spawnParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE,
+                pos.getX() + 0.5, pos.getY() + 1.0, pos.getZ() + 0.5, 30, 0.4, 0.4, 0.4, 0.02);
+        world.playSound(null, pos, SoundEvents.ITEM_ARMOR_EQUIP_CHAIN.value(), SoundCategory.PLAYERS, 1.0f, 1.0f);
+        player.sendMessage(Text.literal(Sheets.crate.get("openMessage").getAsString()), true);
+        return ActionResult.CONSUME;
+    }
+}
+
+package gg.ghostdrop;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+
+/** Loads the design sheets (JSON) that drive all numbers and content. Sheets are the source of truth. */
+public final class Sheets {
+    public static JsonObject weapons, armor, crate, mobs;
+
+    public static void load() {
+        weapons = read("weapons");
+        armor = read("armor");
+        crate = read("crate");
+        mobs = read("mobs");
+    }
+
+    private static JsonObject read(String name) {
+        String path = "/data/ghostdrop/sheets/" + name + ".json";
+        try (var in = Sheets.class.getResourceAsStream(path)) {
+            return JsonParser.parseReader(new InputStreamReader(in, StandardCharsets.UTF_8)).getAsJsonObject();
+        } catch (Exception e) {
+            throw new RuntimeException("Could not load sheet " + path, e);
+        }
+    }
+
+    private Sheets() {}
+}
+
+package gg.ghostdrop;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.minecraft.entity.EntityType;
+import net.minecraft.entity.SpawnReason;
+import net.minecraft.entity.mob.MobEntity;
+import net.minecraft.particle.ParticleTypes;
+import net.minecraft.registry.Registries;
+import net.minecraft.server.network.ServerPlayerEntity;
+import net.minecraft.server.world.ServerWorld;
+import net.minecraft.sound.SoundCategory;
+import net.minecraft.sound.SoundEvents;
+import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.world.Heightmap;
+
+public class GhostDropMod implements ModInitializer {
+    @Override
+    public void onInitialize() {
+        Sheets.load();
+        ModItems.register();
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            if (server.getTicks() % 20 != 0) return; // check once per second
+            String doneTag = Sheets.crate.get("doneTag").getAsString();
+            int after = Sheets.crate.get("dropAfterTicks").getAsInt();
+            for (ServerPlayerEntity p : server.getPlayerManager().getPlayerList()) {
+                if (p.getCommandTags().contains(doneTag) || p.age < after) continue;
+                p.addCommandTag(doneTag);
+                dropCrate((ServerWorld) p.getWorld(), p);
+            }
+        });
+    }
+
+    private static void dropCrate(ServerWorld world, ServerPlayerEntity player) {
+        int dist = Sheets.crate.get("dropDistance").getAsInt();
+        double a = world.random.nextDouble() * Math.PI * 2;
+        int x = player.getBlockX() + (int) (Math.cos(a) * dist);
+        int z = player.getBlockZ() + (int) (Math.sin(a) * dist);
+        int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z);
+        BlockPos pos = new BlockPos(x, y, z);
+        world.setBlockState(pos, ModItems.SUPPLY_CRATE.getDefaultState());
+        world.spawnParticles(ParticleTypes.CAMPFIRE_SIGNAL_SMOKE, x + 0.5, y + 1, z + 0.5, 40, 0.2, 2.0, 0.2, 0.01);
+        world.playSound(null, pos, SoundEvents.ENTITY_GENERIC_EXPLODE.value(), SoundCategory.BLOCKS, 0.6f, 1.4f);
+        player.sendMessage(Text.literal(Sheets.crate.get("dropMessage").getAsString()), false);
+        spawnSquad(world, player);
+    }
+
+    private static void spawnSquad(ServerWorld world, ServerPlayerEntity player) {
+        JsonObject mobs = Sheets.mobs;
+        int min = mobs.get("minRadius").getAsInt(), max = mobs.get("maxRadius").getAsInt();
+        for (JsonElement e : mobs.getAsJsonArray("squad")) {
+            JsonObject row = e.getAsJsonObject();
+            EntityType<?> type = Registries.ENTITY_TYPE.get(Identifier.of(row.get("type").getAsString()));
+            for (int i = 0; i < row.get("count").getAsInt(); i++) {
+                double a = world.random.nextDouble() * Math.PI * 2;
+                double r = min + world.random.nextDouble() * (max - min);
+                int x = player.getBlockX() + (int) (Math.cos(a) * r);
+                int z = player.getBlockZ() + (int) (Math.sin(a) * r);
+                int y = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, x, z);
+                if (type.create(world) instanceof MobEntity mob) {
+                    mob.refreshPositionAndAngles(x + 0.5, y, z + 0.5, world.random.nextFloat() * 360f, 0f);
+                    mob.initialize(world, world.getLocalDifficulty(mob.getBlockPos()), SpawnReason.EVENT, null);
+                    mob.setPersistent();
+                    mob.setTarget(player);
+                    world.spawnEntity(mob);
+                }
+            }
+        }
+    }
+}
+
+{
+  "schemaVersion": 1,
+  "id": "ghostdrop",
+  "version": "${version}",
+  "name": "Ghost Drop",
+  "description": "Find a supply crate, gear up as an operator in Ghost's style, and survive the squad that follows the drop.",
+  "authors": ["You"],
+  "license": "All-Rights-Reserved",
+  "environment": "*",
+  "entrypoints": { "main": ["gg.ghostdrop.GhostDropMod"] },
+  "depends": { "fabricloader": ">=0.16.0", "minecraft": "1.21.1", "java": ">=21", "fabric-api": "*" }
+}
+
+{"variants":{"":{"model":"ghostdrop:block/supply_crate"}}}
+
+{"parent":"minecraft:block/cube_all","textures":{"all":"ghostdrop:block/supply_crate"}}
+
+{"parent":"minecraft:item/handheld","textures":{"layer0":"ghostdrop:item/suppressed_rifle"}}
+
+{"parent":"minecraft:item/generated","textures":{"layer0":"ghostdrop:item/ghost_leggings"}}
+
+{"parent":"minecraft:item/generated","textures":{"layer0":"ghostdrop:item/ghost_boots"}}
+
+{"parent":"minecraft:item/generated","textures":{"layer0":"ghostdrop:item/ghost_chestplate"}}
+
+{"parent":"ghostdrop:block/supply_crate"}
+
+{"parent":"minecraft:item/handheld","textures":{"layer0":"ghostdrop:item/combat_knife"}}
+
+{"parent":"minecraft:item/generated","textures":{"layer0":"ghostdrop:item/ghost_helmet"}}
+
+{
+  "item.ghostdrop.ghost_helmet": "Ghost Skull Mask",
+  "item.ghostdrop.ghost_chestplate": "Ghost Tactical Vest",
+  "item.ghostdrop.ghost_leggings": "Ghost Combat Pants",
+  "item.ghostdrop.ghost_boots": "Ghost Combat Boots",
+  "item.ghostdrop.suppressed_rifle": "Suppressed Rifle",
+  "item.ghostdrop.combat_knife": "Combat Knife",
+  "block.ghostdrop.supply_crate": "Supply Crate"
+}
+
+{
+  "rifle": { "id": "suppressed_rifle", "cooldownTicks": 6, "velocity": 4.0, "inaccuracy": 0.6, "damage": 3.0, "soundVolume": 0.15, "soundPitch": 1.8 },
+  "knife": { "id": "combat_knife", "attackDamage": 4, "attackSpeed": -1.2 }
+}
+
+{
+  "id": "supply_crate",
+  "dropAfterTicks": 2400,
+  "dropDistance": 6,
+  "doneTag": "ghostdrop_done",
+  "dropMessage": "Supply crate inbound. Hostiles are closing in.",
+  "openMessage": "Loadout equipped. Stay quiet, stay alive.",
+  "loadout": ["ghost_helmet", "ghost_chestplate", "ghost_leggings", "ghost_boots", "suppressed_rifle", "combat_knife"]
+}
+
+{
+  "material": { "layer": "ghost", "enchantability": 10, "toughness": 1.0, "knockbackResistance": 0.0, "durabilityMultiplier": 20 },
+  "pieces": [
+    { "id": "ghost_helmet",     "slot": "helmet",     "defense": 2 },
+    { "id": "ghost_chestplate", "slot": "chestplate", "defense": 6 },
+    { "id": "ghost_leggings",   "slot": "leggings",   "defense": 5 },
+    { "id": "ghost_boots",      "slot": "boots",      "defense": 2 }
+  ]
+}
+
+{
+  "minRadius": 12,
+  "maxRadius": 16,
+  "squad": [
+    { "type": "minecraft:husk", "count": 4 },
+    { "type": "minecraft:pillager", "count": 2 }
+  ]
+}
+
+"""Generates the original pixel-art textures (no Call of Duty assets are used)."""
+import zlib, struct, os
+A = "src/main/resources/assets/ghostdrop/textures/"
+
+def png(path, w, h, px):
+    raw = b"".join(b"\x00" + bytes(c for x in range(w) for c in px.get((x, y), (0, 0, 0, 0))) for y in range(h))
+    def ch(t, d): 
+        c = struct.pack(">I", len(d)) + t + d
+        return c + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b""))
+
+def rect(px, x0, y0, x1, y1, c):
+    for y in range(y0, y1):
+        for x in range(x0, x1): px[(x, y)] = c
+
+DARK=(27,27,29,255); VEST=(58,64,56,255); VEST2=(88,94,84,255); WHITE=(235,235,225,255); BLACK=(8,8,8,255)
+BOOT=(40,34,28,255); PANT=(48,52,46,255); WOOD=(98,104,62,255); WOOD2=(60,66,38,255); METAL=(70,72,76,255); METAL2=(120,124,130,255)
+
+def skull(px, ox, oy):  # 8x8 face
+    rect(px, ox, oy, ox+8, oy+8, DARK)
+    rect(px, ox+1, oy+3, ox+7, oy+8, WHITE)
+    for x in (ox+2, ox+3, ox+5, ox+6): px[(x, oy+4)] = BLACK
+    px[(ox+3, oy+6)] = BLACK; px[(ox+4, oy+6)] = BLACK
+    for x in (ox+2, ox+4, ox+6): px[(x, oy+7)] = BLACK
+
+# armor layers (64x32)
+l1 = {}
+rect(l1, 0, 0, 32, 16, DARK); skull(l1, 8, 8)
+rect(l1, 16, 16, 40, 32, VEST); rect(l1, 20, 20, 28, 24, VEST2); rect(l1, 40, 16, 56, 32, VEST)
+rect(l1, 0, 26, 16, 32, BOOT); rect(l1, 16, 26, 32, 32, BOOT)
+png(A+"models/armor/ghost_layer_1.png", 64, 32, l1)
+l2 = {}
+rect(l2, 0, 16, 16, 32, PANT); rect(l2, 16, 16, 40, 32, PANT)
+png(A+"models/armor/ghost_layer_2.png", 64, 32, l2)
+
+# item icons (16x16)
+def icon(name, fn, folder="item"):
+    px = {}; fn(px); png(A+f"{folder}/{name}.png", 16, 16, px)
+def helmet(px): rect(px,3,3,13,13,DARK); rect(px,4,6,12,13,WHITE); [px.__setitem__((x,8),BLACK) for x in (5,6,9,10)]; [px.__setitem__((x,12),BLACK) for x in (5,7,9,11)]
+def chest(px): rect(px,3,2,13,14,VEST); rect(px,0,2,3,9,VEST); rect(px,13,2,16,9,VEST); rect(px,5,6,11,9,VEST2)
+def legs(px): rect(px,3,2,13,7,PANT); rect(px,3,7,7,14,PANT); rect(px,9,7,13,14,PANT)
+def boots(px): rect(px,2,8,7,13,BOOT); rect(px,9,8,14,13,BOOT)
+def rifle(px): rect(px,1,8,15,10,METAL); rect(px,0,8,3,9,METAL2); rect(px,6,10,9,13,DARK); rect(px,10,6,13,8,METAL2); rect(px,12,10,15,12,DARK)
+def knife(px):
+    for i in range(10): px[(3+i,12-i)] = METAL2; px[(4+i,12-i)] = METAL
+    rect(px,2,12,5,15,DARK)
+icon("ghost_helmet", helmet); icon("ghost_chestplate", chest); icon("ghost_leggings", legs); icon("ghost_boots", boots)
+icon("suppressed_rifle", rifle); icon("combat_knife", knife)
+def crate(px):
+    rect(px,0,0,16,16,WOOD); rect(px,0,0,16,1,WOOD2); rect(px,0,15,16,16,WOOD2); rect(px,0,0,1,16,WOOD2); rect(px,15,0,16,16,WOOD2)
+    for i in range(16): px[(i,i)] = WOOD2; px[(15-i,i)] = WOOD2
+    rect(px,6,6,10,10,DARK)
+icon("supply_crate", crate, "block")
+print("textures written")
+
+"""Preflight: every sheet cell filled, every reference resolves, every id has a model, texture and lang entry."""
+import json, os, sys
+R = "src/main/resources/"
+S = lambda n: json.load(open(R + f"data/ghostdrop/sheets/{n}.json"))
+lang = json.load(open(R + "assets/ghostdrop/lang/en_us.json"))
+problems = []
+def walk(path, v):
+    if v is None or v == "" or v == [] : problems.append(f"unfilled cell: {path}")
+    elif isinstance(v, dict): [walk(f"{path}.{k}", x) for k, x in v.items()]
+    elif isinstance(v, list): [walk(f"{path}[{i}]", x) for i, x in enumerate(v)]
+sheets = {n: S(n) for n in ("weapons", "armor", "crate", "mobs")}
+for n, s in sheets.items(): walk(n, s)
+item_ids = {sheets["weapons"]["rifle"]["id"], sheets["weapons"]["knife"]["id"]} | {p["id"] for p in sheets["armor"]["pieces"]}
+for i in sheets["crate"]["loadout"]:
+    if i not in item_ids: problems.append(f"crate.loadout references unknown item: {i}")
+if {p["slot"] for p in sheets["armor"]["pieces"]} != {"helmet", "chestplate", "leggings", "boots"}: problems.append("armor.pieces must cover all four slots")
+for i in item_ids:
+    for f in (f"assets/ghostdrop/models/item/{i}.json", f"assets/ghostdrop/textures/item/{i}.png"):
+        if not os.path.exists(R + f): problems.append(f"missing file: {f}")
+    if f"item.ghostdrop.{i}" not in lang: problems.append(f"missing lang key for item {i}")
+cid = sheets["crate"]["id"]
+for f in (f"assets/ghostdrop/models/item/{cid}.json", f"assets/ghostdrop/models/block/{cid}.json", f"assets/ghostdrop/blockstates/{cid}.json", f"assets/ghostdrop/textures/block/{cid}.png"):
+    if not os.path.exists(R + f): problems.append(f"missing file: {f}")
+if f"block.ghostdrop.{cid}" not in lang: problems.append("missing lang key for crate")
+layer = sheets["armor"]["material"]["layer"]
+for n in (1, 2):
+    if not os.path.exists(R + f"assets/ghostdrop/textures/models/armor/{layer}_layer_{n}.png"): problems.append(f"missing armor layer {n}")
+if sheets["mobs"]["minRadius"] > sheets["mobs"]["maxRadius"]: problems.append("mobs.minRadius > maxRadius")
+print("PREFLIGHT:", "CLEAN" if not problems else f"{len(problems)} problem(s)")
+[print(" -", p) for p in problems]
+sys.exit(1 if problems else 0)
